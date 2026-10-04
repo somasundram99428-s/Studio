@@ -202,3 +202,94 @@ def locate_face(img):
     small = img.resize((max(1, int(img.width * s)), max(1, int(img.height * s))), Image.BILINEAR, reducing_gap=2.0)
     found = _find_face(np.asarray(small.convert("L")), np.asarray(small))
     return None if found is None else (found[0], found[1], s)
+def passport_crop(img, loc="auto", scale=1.0):
+    if isinstance(loc, str):
+        loc = locate_face(img)
+    pw, ph = round(PH_W * scale), round(PH_H * scale)
+    rs = Image.LANCZOS if scale >= 1 else Image.BICUBIC
+    if loc is None:
+        return enhance(ImageOps.fit(img, (pw, ph), rs, centering=(0.5, 0.4)), scale), False, False, False
+    (x, y, w, h), eyes, s = loc
+    cx, cy, fh = (x + w / 2) / s, (y + h / 2) / s, h / s
+    ang = 0.0
+    eyes = sorted(eyes, key=lambda e: -e[2])[:2]
+    if len(eyes) == 2:
+        (x1, y1, w1, h1), (x2, y2, w2, h2) = sorted(eyes, key=lambda e: e[0])
+        a = float(np.degrees(np.arctan2((y2 + h2 / 2) - (y1 + h1 / 2), (x2 + w2 / 2) - (x1 + w1 / 2))))
+        if 0.7 < abs(a) < 12:
+            ang = a
+
+    ch = fh * CROP_H_FACTOR
+    cw = ch * PH_W / PH_H
+    if cw > img.width:
+        f = max(0.85, img.width / cw)
+        ch, cw = ch * f, cw * f
+    top, left = cy - CROP_FACE_Y * ch, cx - cw / 2
+    head_top = cy - 0.95 * fh
+    if top + ch > img.height:
+        top -= min(top + ch - img.height, max(0.0, head_top - 0.04 * ch - top))
+    elif top < 0:
+        top += min(-top, max(0.0, img.height - (top + ch)), max(0.0, head_top - 0.04 * ch - top))
+    if cw <= img.width:
+        left = min(max(left, 0.0), img.width - cw)
+    bw, bh = max(8, int(round(cw))), max(8, int(round(ch)))
+    x0, y0 = int(round(left)), int(round(top))
+
+    pad = int(0.2 * ch) if ang else 0
+    arr = _grab(img, x0 - pad, y0 - pad, x0 + bw + pad, y0 + bh + pad)
+    ds = min(1.0, 2.0 * pw / bw) if (ang and scale < 1) else 1.0
+    if ds < 0.8:
+        arr = cv2.resize(arr, (max(1, round(arr.shape[1] * ds)), max(1, round(arr.shape[0] * ds))),
+                         interpolation=cv2.INTER_AREA)
+    else:
+        ds = 1.0
+    if ang:
+        M = cv2.getRotationMatrix2D(((cx - (x0 - pad)) * ds, (cy - (y0 - pad)) * ds), ang, 1.0)
+        arr = cv2.warpAffine(arr, M, (arr.shape[1], arr.shape[0]), flags=cv2.INTER_CUBIC,
+                             borderMode=cv2.BORDER_REFLECT_101)
+    p2 = round(pad * ds)
+    arr = arr[p2:p2 + round(bh * ds), p2:p2 + round(bw * ds)]
+    low_res = bw < MIN_CROP_W
+    result = Image.fromarray(arr).resize((pw, ph), rs)
+    if low_res:
+        result = result.filter(ImageFilter.UnsharpMask(max(0.5, 1.5 * scale), 80, 3))
+    result = enhance(result, scale)
+    bg_ok = False
+    if CHANGE_BG:
+        face_out = ((cx - x0) / bw * pw, (cy - y0) / bh * ph, fh / bh * ph)
+        result, bg_ok = blue_background(result, face_out)
+    return result, True, low_res, bg_ok
+
+
+SHEETS = {4: (4, 1, 2, 2), 8: (4, 2, 2, 2)}
+
+
+def make_sheet(photo, copies):
+    cols, rows, cgap_mm, rgap_mm = SHEETS[copies]
+    sheet = Image.new("RGB", (SH_W, SH_H), "white")
+    cgap, rgap = mm(cgap_mm), mm(rgap_mm)
+    cell_w, cell_h = photo.width, photo.height
+    x0 = (SH_W - (cols * cell_w + (cols - 1) * cgap)) // 2
+    y0 = (SH_H - (rows * cell_h + (rows - 1) * rgap)) // 2
+    d = ImageDraw.Draw(sheet)
+    for r in range(rows):
+        for c in range(cols):
+            x, y = x0 + c * (cell_w + cgap), y0 + r * (cell_h + rgap)
+            sheet.paste(photo, (x, y))
+            d.rectangle((x, y, x + cell_w - 1, y + cell_h - 1), outline=(0, 0, 0), width=BORDER)
+    return sheet
+
+
+FULL_MARGIN = mm(4)
+
+
+def make_full(img):
+    if img.height > img.width:
+        img = img.rotate(90, expand=True)
+    inner_w, inner_h = SH_W - 2 * FULL_MARGIN, SH_H - 2 * FULL_MARGIN
+    photo = enhance(ImageOps.fit(img, (inner_w - 2 * BORDER, inner_h - 2 * BORDER), Image.LANCZOS))
+    sheet = Image.new("RGB", (SH_W, SH_H), "white")
+    x, y = FULL_MARGIN, FULL_MARGIN
+    sheet.paste(photo, (x + BORDER, y + BORDER))
+    ImageDraw.Draw(sheet).rectangle((x, y, x + inner_w - 1, y + inner_h - 1), outline=(0, 0, 0), width=BORDER)
+    return sheet
